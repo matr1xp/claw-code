@@ -1,10 +1,12 @@
 use std::collections::{BTreeMap, VecDeque};
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::error::ApiError;
+use crate::http_client::build_http_client_or_default;
 use crate::types::{
     ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent, ContentBlockStopEvent,
     InputContentBlock, InputMessage, MessageDelta, MessageDeltaEvent, MessageRequest,
@@ -18,9 +20,9 @@ pub const DEFAULT_XAI_BASE_URL: &str = "https://api.x.ai/v1";
 pub const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 const REQUEST_ID_HEADER: &str = "request-id";
 const ALT_REQUEST_ID_HEADER: &str = "x-request-id";
-const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_millis(200);
-const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(2);
-const DEFAULT_MAX_RETRIES: u32 = 2;
+const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
+const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(128);
+const DEFAULT_MAX_RETRIES: u32 = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OpenAiCompatConfig {
@@ -81,7 +83,7 @@ impl OpenAiCompatClient {
     #[must_use]
     pub fn new(api_key: impl Into<String>, config: OpenAiCompatConfig) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: build_http_client_or_default(),
             api_key: api_key.into(),
             config,
             base_url: read_base_url(config),
@@ -131,7 +133,15 @@ impl OpenAiCompatClient {
         preflight_message_request(&request)?;
         let response = self.send_with_retry(&request).await?;
         let request_id = request_id_from_headers(response.headers());
-        let payload = response.json::<ChatCompletionResponse>().await?;
+        let body = response.text().await.map_err(ApiError::from)?;
+        let payload = serde_json::from_str::<ChatCompletionResponse>(&body).map_err(|error| {
+            ApiError::json_deserialize(
+                self.config.provider_name,
+                &request.model,
+                &body,
+                error,
+            )
+        })?;
         let mut normalized = normalize_response(&request.model, payload)?;
         if normalized.request_id.is_none() {
             normalized.request_id = request_id;
@@ -150,7 +160,10 @@ impl OpenAiCompatClient {
         Ok(MessageStream {
             request_id: request_id_from_headers(response.headers()),
             response,
-            parser: OpenAiSseParser::new(),
+            parser: OpenAiSseParser::with_context(
+                self.config.provider_name,
+                request.model.clone(),
+            ),
             pending: VecDeque::new(),
             done: false,
             state: StreamState::new(request.model.clone()),
@@ -179,7 +192,7 @@ impl OpenAiCompatClient {
                 break retryable_error;
             }
 
-            tokio::time::sleep(self.backoff_for_attempt(attempts)?).await;
+            tokio::time::sleep(self.jittered_backoff_for_attempt(attempts)?).await;
         };
 
         Err(ApiError::RetriesExhausted {
@@ -215,6 +228,37 @@ impl OpenAiCompatClient {
             .checked_mul(multiplier)
             .map_or(self.max_backoff, |delay| delay.min(self.max_backoff)))
     }
+
+    fn jittered_backoff_for_attempt(&self, attempt: u32) -> Result<Duration, ApiError> {
+        let base = self.backoff_for_attempt(attempt)?;
+        Ok(base + jitter_for_base(base))
+    }
+}
+
+/// Process-wide counter that guarantees distinct jitter samples even when
+/// the system clock resolution is coarser than consecutive retry sleeps.
+static JITTER_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Returns a random additive jitter in `[0, base]` to decorrelate retries
+/// from multiple concurrent clients. Entropy is drawn from the nanosecond
+/// wall clock mixed with a monotonic counter and run through a splitmix64
+/// finalizer; adequate for retry jitter (no cryptographic requirement).
+fn jitter_for_base(base: Duration) -> Duration {
+    let base_nanos = u64::try_from(base.as_nanos()).unwrap_or(u64::MAX);
+    if base_nanos == 0 {
+        return Duration::ZERO;
+    }
+    let raw_nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX))
+        .unwrap_or(0);
+    let tick = JITTER_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut mixed = raw_nanos.wrapping_add(tick).wrapping_add(0x9E37_79B9_7F4A_7C15);
+    mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    mixed ^= mixed >> 31;
+    let jitter_nanos = mixed % base_nanos.saturating_add(1);
+    Duration::from_nanos(jitter_nanos)
 }
 
 impl Provider for OpenAiCompatClient {
@@ -282,11 +326,17 @@ impl MessageStream {
 #[derive(Debug, Default)]
 struct OpenAiSseParser {
     buffer: Vec<u8>,
+    provider: String,
+    model: String,
 }
 
 impl OpenAiSseParser {
-    fn new() -> Self {
-        Self::default()
+    fn with_context(provider: impl Into<String>, model: impl Into<String>) -> Self {
+        Self {
+            buffer: Vec::new(),
+            provider: provider.into(),
+            model: model.into(),
+        }
     }
 
     fn push(&mut self, chunk: &[u8]) -> Result<Vec<ChatCompletionChunk>, ApiError> {
@@ -294,7 +344,7 @@ impl OpenAiSseParser {
         let mut events = Vec::new();
 
         while let Some(frame) = next_sse_frame(&mut self.buffer) {
-            if let Some(event) = parse_sse_frame(&frame)? {
+            if let Some(event) = parse_sse_frame(&frame, &self.provider, &self.model)? {
                 events.push(event);
             }
         }
@@ -640,6 +690,19 @@ struct ErrorBody {
     message: Option<String>,
 }
 
+/// Returns true for models known to reject tuning parameters like temperature,
+/// top_p, frequency_penalty, and presence_penalty. These are typically
+/// reasoning/chain-of-thought models with fixed sampling.
+fn is_reasoning_model(model: &str) -> bool {
+    let lowered = model.to_ascii_lowercase();
+    // OpenAI reasoning models
+    lowered.starts_with("o1")
+        || lowered.starts_with("o3")
+        || lowered.starts_with("o4")
+        // xAI reasoning: grok-3-mini always uses reasoning mode
+        || lowered == "grok-3-mini"
+}
+
 fn build_chat_completion_request(request: &MessageRequest, config: OpenAiCompatConfig) -> Value {
     let mut messages = Vec::new();
     if let Some(system) = request.system.as_ref().filter(|value| !value.is_empty()) {
@@ -669,6 +732,30 @@ fn build_chat_completion_request(request: &MessageRequest, config: OpenAiCompatC
     }
     if let Some(tool_choice) = &request.tool_choice {
         payload["tool_choice"] = openai_tool_choice(tool_choice);
+    }
+
+    // OpenAI-compatible tuning parameters — only included when explicitly set.
+    // Reasoning models (o1/o3/o4/grok-3-mini) reject these params with 400;
+    // silently strip them to avoid cryptic provider errors.
+    if !is_reasoning_model(&request.model) {
+        if let Some(temperature) = request.temperature {
+            payload["temperature"] = json!(temperature);
+        }
+        if let Some(top_p) = request.top_p {
+            payload["top_p"] = json!(top_p);
+        }
+        if let Some(frequency_penalty) = request.frequency_penalty {
+            payload["frequency_penalty"] = json!(frequency_penalty);
+        }
+        if let Some(presence_penalty) = request.presence_penalty {
+            payload["presence_penalty"] = json!(presence_penalty);
+        }
+    }
+    // stop is generally safe for all providers
+    if let Some(stop) = &request.stop {
+        if !stop.is_empty() {
+            payload["stop"] = json!(stop);
+        }
     }
 
     payload
@@ -835,7 +922,11 @@ fn next_sse_frame(buffer: &mut Vec<u8>) -> Option<String> {
     Some(String::from_utf8_lossy(&frame[..frame_len]).into_owned())
 }
 
-fn parse_sse_frame(frame: &str) -> Result<Option<ChatCompletionChunk>, ApiError> {
+fn parse_sse_frame(
+    frame: &str,
+    provider: &str,
+    model: &str,
+) -> Result<Option<ChatCompletionChunk>, ApiError> {
     let trimmed = frame.trim();
     if trimmed.is_empty() {
         return Ok(None);
@@ -857,15 +948,15 @@ fn parse_sse_frame(frame: &str) -> Result<Option<ChatCompletionChunk>, ApiError>
     if payload == "[DONE]" {
         return Ok(None);
     }
-    serde_json::from_str(&payload)
+    serde_json::from_str::<ChatCompletionChunk>(&payload)
         .map(Some)
-        .map_err(ApiError::from)
+        .map_err(|error| ApiError::json_deserialize(provider, model, &payload, error))
 }
 
 fn read_env_non_empty(key: &str) -> Result<Option<String>, ApiError> {
     match std::env::var(key) {
         Ok(value) if !value.is_empty() => Ok(Some(value)),
-        Ok(_) | Err(std::env::VarError::NotPresent) => Ok(None),
+        Ok(_) | Err(std::env::VarError::NotPresent) => Ok(super::dotenv_value(key)),
         Err(error) => Err(ApiError::from(error)),
     }
 }
@@ -906,6 +997,7 @@ async fn expect_success(response: reqwest::Response) -> Result<reqwest::Response
         return Ok(response);
     }
 
+    let request_id = request_id_from_headers(response.headers());
     let body = response.text().await.unwrap_or_default();
     let parsed_error = serde_json::from_str::<ErrorEnvelope>(&body).ok();
     let retryable = is_retryable_status(status);
@@ -918,6 +1010,7 @@ async fn expect_success(response: reqwest::Response) -> Result<reqwest::Response
         message: parsed_error
             .as_ref()
             .and_then(|error| error.error.message.clone()),
+        request_id,
         body,
         retryable,
     })
@@ -953,8 +1046,9 @@ impl StringExt for String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_chat_completion_request, chat_completions_endpoint, normalize_finish_reason,
-        openai_tool_choice, parse_tool_arguments, OpenAiCompatClient, OpenAiCompatConfig,
+        build_chat_completion_request, chat_completions_endpoint, is_reasoning_model,
+        normalize_finish_reason, openai_tool_choice, parse_tool_arguments, OpenAiCompatClient,
+        OpenAiCompatConfig,
     };
     use crate::error::ApiError;
     use crate::types::{
@@ -993,6 +1087,7 @@ mod tests {
                 }]),
                 tool_choice: Some(ToolChoice::Auto),
                 stream: false,
+                ..Default::default()
             },
             OpenAiCompatConfig::xai(),
         );
@@ -1015,6 +1110,7 @@ mod tests {
                 tools: None,
                 tool_choice: None,
                 stream: true,
+            ..Default::default()
             },
             OpenAiCompatConfig::openai(),
         );
@@ -1033,6 +1129,7 @@ mod tests {
                 tools: None,
                 tool_choice: None,
                 stream: true,
+            ..Default::default()
             },
             OpenAiCompatConfig::xai(),
         );
@@ -1102,5 +1199,80 @@ mod tests {
     fn normalizes_stop_reasons() {
         assert_eq!(normalize_finish_reason("stop"), "end_turn");
         assert_eq!(normalize_finish_reason("tool_calls"), "tool_use");
+    }
+
+    #[test]
+    fn tuning_params_included_in_payload_when_set() {
+        let request = MessageRequest {
+            model: "gpt-4o".to_string(),
+            max_tokens: 1024,
+            messages: vec![],
+            system: None,
+            tools: None,
+            tool_choice: None,
+            stream: false,
+            temperature: Some(0.7),
+            top_p: Some(0.9),
+            frequency_penalty: Some(0.5),
+            presence_penalty: Some(0.3),
+            stop: Some(vec!["\n".to_string()]),
+        };
+        let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
+        assert_eq!(payload["temperature"], 0.7);
+        assert_eq!(payload["top_p"], 0.9);
+        assert_eq!(payload["frequency_penalty"], 0.5);
+        assert_eq!(payload["presence_penalty"], 0.3);
+        assert_eq!(payload["stop"], json!(["\n"]));
+    }
+
+    #[test]
+    fn reasoning_model_strips_tuning_params() {
+        let request = MessageRequest {
+            model: "o1-mini".to_string(),
+            max_tokens: 1024,
+            messages: vec![],
+            stream: false,
+            temperature: Some(0.7),
+            top_p: Some(0.9),
+            frequency_penalty: Some(0.5),
+            presence_penalty: Some(0.3),
+            stop: Some(vec!["\n".to_string()]),
+            ..Default::default()
+        };
+        let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
+        assert!(payload.get("temperature").is_none(), "reasoning model should strip temperature");
+        assert!(payload.get("top_p").is_none(), "reasoning model should strip top_p");
+        assert!(payload.get("frequency_penalty").is_none());
+        assert!(payload.get("presence_penalty").is_none());
+        // stop is safe for all providers
+        assert_eq!(payload["stop"], json!(["\n"]));
+    }
+
+    #[test]
+    fn grok_3_mini_is_reasoning_model() {
+        assert!(is_reasoning_model("grok-3-mini"));
+        assert!(is_reasoning_model("o1"));
+        assert!(is_reasoning_model("o1-mini"));
+        assert!(is_reasoning_model("o3-mini"));
+        assert!(!is_reasoning_model("gpt-4o"));
+        assert!(!is_reasoning_model("grok-3"));
+        assert!(!is_reasoning_model("claude-sonnet-4-6"));
+    }
+
+    #[test]
+    fn tuning_params_omitted_from_payload_when_none() {
+        let request = MessageRequest {
+            model: "gpt-4o".to_string(),
+            max_tokens: 1024,
+            messages: vec![],
+            stream: false,
+            ..Default::default()
+        };
+        let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
+        assert!(payload.get("temperature").is_none(), "temperature should be absent");
+        assert!(payload.get("top_p").is_none(), "top_p should be absent");
+        assert!(payload.get("frequency_penalty").is_none());
+        assert!(payload.get("presence_penalty").is_none());
+        assert!(payload.get("stop").is_none());
     }
 }

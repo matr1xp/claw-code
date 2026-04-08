@@ -309,7 +309,26 @@ Priority order: P0 = blocks CI/green state, P1 = blocks integration wiring, P2 =
 20. **Session state classification gap (working vs blocked vs finished vs truly stale)** — **done**: agent manifests now derive machine states such as `working`, `blocked_background_job`, `blocked_merge_conflict`, `degraded_mcp`, `interrupted_transport`, `finished_pending_report`, and `finished_cleanable`, and terminal-state persistence records commit provenance plus derived state so downstream monitoring can distinguish quiet progress from truly idle sessions.
 21. **Resumed `/status` JSON parity gap** — dogfooding shows fresh `claw status --output-format json` now emits structured JSON, but resumed slash-command status still leaks through a text-shaped path in at least one dispatch path. Local CI-equivalent repro fails `rust/crates/rusty-claude-cli/tests/resume_slash_commands.rs::resumed_status_command_emits_structured_json_when_requested` with `expected value at line 1 column 1`, so resumed automation can receive text where JSON was explicitly requested. **Action:** unify fresh vs resumed `/status` rendering through one output-format contract and add regression coverage so resumed JSON output is guaranteed valid.
 22. **Opaque failure surface for session/runtime crashes** — repeated dogfood-facing failures can currently collapse to generic wrappers like `Something went wrong while processing your request. Please try again, or use /new to start a fresh session.` without exposing whether the fault was provider auth, session corruption, slash-command dispatch, render failure, or transport/runtime panic. This blocks fast self-recovery and turns actionable clawability bugs into blind retries. **Action:** preserve a short user-safe failure class (`provider_auth`, `session_load`, `command_dispatch`, `render`, `runtime_panic`, etc.), attach a local trace/session id, and ensure operators can jump from the chat-visible error to the exact failure log quickly.
-23. **`doctor --output-format json` check-level structure gap** — direct dogfooding shows `claw doctor --output-format json` exposes `has_failures` at the top level, but individual check results (`auth`, `config`, `workspace`, `sandbox`, `system`) are buried inside flat prose fields like `message` / `report`. That forces claws to string-scrape human text instead of consuming stable machine-readable diagnostics. **Action:** emit structured per-check JSON (`name`, `status`, `summary`, `details`, and relevant typed fields such as sandbox fallback reason) while preserving the current human-readable report for text mode.
+23. **`doctor --output-format json` check-level structure gap** — **done**: `claw doctor --output-format json` now keeps the human-readable `message`/`report` while also emitting structured per-check diagnostics (`name`, `status`, `summary`, `details`, plus typed fields like workspace paths and sandbox fallback data), with regression coverage in `output_format_contract.rs`.
+24. **Plugin lifecycle init/shutdown test flakes under workspace-parallel execution** — dogfooding surfaced that `build_runtime_runs_plugin_lifecycle_init_and_shutdown` can fail under `cargo test --workspace` while passing in isolation because sibling tests race on tempdir-backed shell init script paths. This is test brittleness rather than a code-path regression, but it still destabilizes CI confidence and wastes diagnosis cycles. **Action:** isolate temp resources per test robustly (unique dirs + no shared cwd assumptions), audit cleanup timing, and add a regression guard so the plugin lifecycle test remains stable under parallel workspace execution.
+26. **Resumed local-command JSON parity gap** — **done**: direct `claw --output-format json` already had structured renderers for `sandbox`, `mcp`, `skills`, `version`, and `init`, but resumed `claw --output-format json --resume <session> /…` paths still fell back to prose because resumed slash dispatch only emitted JSON for `/status`. Resumed `/sandbox`, `/mcp`, `/skills`, `/version`, and `/init` now reuse the same JSON envelopes as their direct CLI counterparts, with regression coverage in `rust/crates/rusty-claude-cli/tests/resume_slash_commands.rs` and `rust/crates/rusty-claude-cli/tests/output_format_contract.rs`.
+
+41. **Phantom completions root cause: global session store has no per-worktree isolation** —
+
+    **Root cause.** The session store under `~/.local/share/opencode` is global to the host. Every `opencode serve` instance — including the parallel lane workers spawned per worktree — reads and writes the same on-disk session directory. Sessions are keyed only by id and timestamp, not by the workspace they were created in, so there is no structural barrier between a session created in worktree `/tmp/b4-phantom-diag` and one created in `/tmp/b4-omc-flat`. Whichever serve instance picks up a given session id can drive it from whatever CWD that serve happens to be running in.
+
+    **Impact.** Parallel lanes silently cross wires. A lane reports a clean run — file edits, builds, tests — and the orchestrator marks the lane green, but the writes were applied against another worktree's CWD because a sibling `opencode serve` won the session race. The originating worktree shows no diff, the *other* worktree gains unexplained edits, and downstream consumers (clawhip lane events, PR pushes, merge gates) treat the empty originator as a successful no-op. These are the "phantom completions" we keep chasing: success messaging without any landed changes in the lane that claimed them, plus stray edits in unrelated lanes whose own runs never touched those files. Because the report path is happy, retries and recovery recipes never fire, so the lane silently wedges until a human notices the diff is empty.
+
+    **Proposed fix.** Bind every session to its workspace root + branch at creation time and refuse to drive it from any other CWD.
+
+    - At session creation, capture the canonical workspace root (resolved git worktree path) and the active branch and persist them on the session record.
+    - On every load (`opencode serve`, slash-command resume, lane recovery), validate that the current process CWD matches the persisted workspace root before any tool with side effects (file_ops, bash, git) is allowed to run. Mismatches surface as a typed `WorkspaceMismatch` failure class instead of silently writing to the wrong tree.
+    - Namespace the on-disk session path under the workspace fingerprint (e.g. `<session_store>/<workspace_hash>/<session_id>`) so two parallel `opencode serve` instances physically cannot collide on the same session id.
+    - Forks inherit the parent's workspace root by default; an explicit re-bind is required to move a session to a new worktree, and that re-bind is itself recorded as a structured event so the orchestrator can audit cross-worktree handoffs.
+    - Surface a `branch.workspace_mismatch` lane event so clawhip stops counting wrong-CWD writes as lane completions.
+
+    **Status.** A `workspace_root` field has been added to `Session` in `rust/crates/runtime/src/session.rs` (with builder, accessor, JSON + JSONL round-trip, fork inheritance, and given/when/then test coverage in `persists_workspace_root_round_trip_and_forks_inherit_it`). The CWD validation, the namespaced on-disk path, and the `branch.workspace_mismatch` lane event are still outstanding and tracked under this item.
+
 **P3 — Swarm efficiency**
 13. Swarm branch-lock protocol — **done**: `branch_lock::detect_branch_lock_collisions()` now detects same-branch/same-scope and nested-module collisions before parallel lanes drift into duplicate implementation
 14. Commit provenance / worktree-aware push events — **done**: lane event provenance now includes branch/worktree/superseded/canonical lineage metadata, and manifest persistence de-dupes superseded commit events before downstream consumers render them
@@ -366,3 +385,77 @@ to:
 - a **claw-native execution runtime**
 - an **event-native orchestration substrate**
 - a **plugin/hook-first autonomous coding harness**
+
+## Deployment Architecture Gap (filed from dogfood 2026-04-08)
+
+### WorkerState is in the runtime; /state is NOT in opencode serve
+
+**Root cause discovered during batch 8 dogfood.**
+
+`worker_boot.rs` has a solid `WorkerStatus` state machine (`Spawning → TrustRequired → ReadyForPrompt → Running → Finished/Failed`). It is exported from `runtime/src/lib.rs` as a public API. But claw-code is a **plugin** loaded inside the `opencode` binary — it cannot add HTTP routes to `opencode serve`. The HTTP server is 100% owned by the upstream opencode process (v1.3.15).
+
+**Impact:** There is no way to `curl localhost:4710/state` and get back a JSON `WorkerStatus`. Any such endpoint would require either:
+1. Upstreaming a `/state` route into opencode's HTTP server (requires a PR to sst/opencode), or
+2. Writing a sidecar HTTP process that queries the `WorkerRegistry` in-process (possible but fragile), or
+3. Writing `WorkerStatus` to a well-known file path (`.claw/worker-state.json`) that an external observer can poll.
+
+**Recommended path:** Option 3 — emit `WorkerStatus` transitions to `.claw/worker-state.json` on every state change. This is purely within claw-code's plugin scope, requires no upstream changes, and gives clawhip a file it can poll to distinguish a truly stalled worker from a quiet-but-progressing one.
+
+**Action item:** Wire `WorkerRegistry::transition()` to atomically write `.claw/worker-state.json` on every state transition. Add a `claw state` CLI subcommand that reads and prints this file. Add regression test.
+
+**Prior session note:** A previous session summary claimed commit `0984cca` landed a `/state` HTTP endpoint via axum. This was incorrect — no such commit exists on main, axum is not a dependency, and the HTTP server is not ours. The actual work that exists: `worker_boot.rs` with `WorkerStatus` enum + `WorkerRegistry`, fully wired into `runtime/src/lib.rs` as public exports.
+
+## Startup Friction Gap: No Default trusted_roots in Settings (filed 2026-04-08)
+
+### Every lane starts with manual trust babysitting unless caller explicitly passes roots
+
+**Root cause discovered during direct dogfood of WorkerCreate tool.**
+
+`WorkerCreate` accepts a `trusted_roots: Vec<String>` parameter. If the caller omits it (or passes `[]`), every new worker immediately enters `TrustRequired` and stalls — requiring manual intervention to advance to `ReadyForPrompt`. There is no mechanism to configure a default allowlist in `settings.json` or `.claw/settings.json`.
+
+**Impact:** Batch tooling (clawhip, lane orchestrators) must pass `trusted_roots` explicitly on every `WorkerCreate` call. If a batch script forgets the field, all workers in that batch stall silently at `trust_required`. This was the root cause of several "batch 8 lanes not advancing" incidents.
+
+**Recommended fix:**
+1. Add a `trusted_roots` field to `RuntimeConfig` (or a nested `[trust]` table), loaded via `ConfigLoader`.
+2. In `WorkerRegistry::spawn_worker()`, merge config-level `trusted_roots` with any per-call overrides.
+3. Default: empty list (safest). Users opt in by adding their repo paths to settings.
+4. Update `config_validate` schema with the new field.
+
+**Action item:** Wire `RuntimeConfig::trusted_roots()` → `WorkerRegistry::spawn_worker()` default. Cover with test: config with `trusted_roots = ["/tmp"]` → spawning worker in `/tmp/x` auto-resolves trust without caller passing the field.
+
+## Observability Transport Decision (filed 2026-04-08)
+
+### Canonical state surface: CLI/file-based. HTTP endpoint deferred.
+
+**Decision:** `claw state` reading `.claw/worker-state.json` is the **blessed observability contract** for clawhip and downstream tooling. This is not a stepping-stone — it is the supported surface. Build against it.
+
+**Rationale:**
+- claw-code is a plugin running inside the opencode binary. It cannot add HTTP routes to `opencode serve` — that server belongs to upstream sst/opencode.
+- The file-based surface is fully within plugin scope: `emit_state_file()` in `worker_boot.rs` writes atomically on every `WorkerStatus` transition.
+- `claw state --output-format json` gives clawhip everything it needs: `status`, `is_ready`, `seconds_since_update`, `trust_gate_cleared`, `last_event`, `updated_at`.
+- Polling a local file has lower latency and fewer failure modes than an HTTP round-trip to a sidecar.
+- An HTTP state endpoint would require either (a) upstreaming a route to sst/opencode — a multi-week PR cycle with no guarantee of acceptance — or (b) a sidecar process that queries `WorkerRegistry` in-process, which is fragile and adds an extra failure domain.
+
+**What downstream tooling (clawhip) should do:**
+1. After `WorkerCreate`, poll `.claw/worker-state.json` (or run `claw state --output-format json`) in the worker's CWD at whatever interval makes sense (e.g. 5s).
+2. Trust `seconds_since_update > 60` in `trust_required` status as the stall signal.
+3. Call `WorkerResolveTrust` tool to unblock, or `WorkerRestart` to reset.
+
+**HTTP endpoint tracking:** Not scheduled. If a concrete use case emerges that file polling cannot serve (e.g. remote workers over a network boundary), open a new issue to upstream a `/worker/state` route to sst/opencode at that time. Until then: file/CLI is canonical.
+
+## Provider Routing: Model-Name Prefix Must Win Over Env-Var Presence (fixed 2026-04-08, `0530c50`)
+
+### `openai/gpt-4.1-mini` was silently misrouted to Anthropic when ANTHROPIC_API_KEY was set
+
+**Root cause:** `metadata_for_model` returned `None` for any model not matching `claude` or `grok` prefix.
+`detect_provider_kind` then fell through to auth-sniffer order: first `has_auth_from_env_or_saved()` (Anthropic), then `OPENAI_API_KEY`, then `XAI_API_KEY`.
+
+If `ANTHROPIC_API_KEY` was present in the environment (e.g. user has both Anthropic and OpenRouter configured), any unknown model — including explicitly namespaced ones like `openai/gpt-4.1-mini` — was silently routed to the Anthropic client, which then failed with `missing Anthropic credentials` or a confusing 402/auth error rather than routing to OpenAI-compatible.
+
+**Fix:** Added explicit prefix checks in `metadata_for_model`:
+- `openai/` prefix → `ProviderKind::OpenAi`
+- `gpt-` prefix → `ProviderKind::OpenAi`
+
+Model name prefix now wins unconditionally over env-var presence. Regression test locked in: `providers::tests::openai_namespaced_model_routes_to_openai_not_anthropic`.
+
+**Lesson:** Auth-sniffer fallback order is fragile. Any new provider added in the future should be registered in `metadata_for_model` via a model-name prefix, not left to env-var order. This is the canonical extension point.
